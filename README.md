@@ -57,6 +57,7 @@ See `config.py` for more configuration options.
 ### Running the Server
 
 ```bash
+source .venv/bin/activate
 uv run src/main.py
 ```
 
