@@ -184,3 +184,44 @@ log.jsonl
 .aider*
 
 **/.claude/settings.local.json
+
+# Environment and config files
+.env
+.env.*
+*.env
+*.env.*
+
+# Log files
+log.jsonl
+*.log
+*.jsonl
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode and editor settings
+.vscode/
+.idea/
+
+# Test and coverage artifacts
+.coverage
+htmlcov/
+*.cover
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache/
+.cache/
+.mypy_cache/
+.dmypy.json
+.pytest_cache/
+
+# Jupyter notebooks
+*.ipynb_checkpoints
+
+# OS files
+.DS_Store
+
+# Research and playground envs
+env-research/
