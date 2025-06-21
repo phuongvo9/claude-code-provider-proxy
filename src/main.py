@@ -38,23 +38,59 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # A. Declarative capability map (extendable via env or YAML)
 # ---------------------------------------------------------------------------
+
 MODEL_CAPABILITIES: Dict[str, set[str]] = {
-    # OpenAI family – all support tools
+    # --- OpenAI family ------------------------------------------------------
     "gpt-4o": {"tools"},
     "gpt-4o-mini": {"tools"},
     "gpt-4": {"tools"},
     "gpt-4-turbo": {"tools"},
     "gpt-3.5-turbo": {"tools"},
-    
-    # Anthropic variants on OpenRouter that DO support tools
+
+    # --- Anthropic ----------------------------------------------------------
     "anthropic/claude-3-opus:beta": {"tools"},
     "anthropic/claude-3-opus": {"tools"},
     "anthropic/claude-3-sonnet": {"tools"},
     "anthropic/claude-3-haiku": {"tools"},
     "anthropic/claude-3.5-sonnet": {"tools"},
     "anthropic/claude-3.5-haiku": {"tools"},
-    
-    # OSS & :free SKUs – no tool support
+    "anthropic/claude-opus-4": {"tools"},
+    "anthropic/claude-sonnet-4": {"tools"},
+
+    # --- Google Gemini ------------------------------------------------------
+    "google/gemini-2.5-flash-lite-preview-06-17": {"tools"},
+    "google/gemini-2.5-flash": {"tools"},
+    "google/gemini-2.5-flash-preview-05-20": {"tools"},
+    "google/gemini-2.5-flash-preview-05-20:thinking": {"tools"},
+    "google/gemini-2.5-pro": {"tools"},
+    "google/gemini-2.5-pro-preview": {"tools"},
+    "google/gemini-2.5-pro-preview-05-06": {"tools"},
+    "google/gemini-2.5-pro-preview-06-05": {"tools"},
+    "google/gemini-2.5-pro-preview-05-06": {"tools"},
+
+    # --- Mistral / Magistral / Devstral -------------------------------------
+    "mistralai/magistral-small-2506": {"tools"},
+    "mistralai/magistral-medium-2506": {"tools"},
+    "mistralai/magistral-medium-2506:thinking": {"tools"},
+    "mistralai/mistral-medium-3": {"tools"},
+    "mistralai/devstral-small": {"tools"},
+    "mistralai/devstral-small:free": {"tools"},
+
+    # --- MiniMax & others ----------------------------------------------------
+    "minimax/minimax-m1:extended": {"tools"},
+    "openai/o3-pro": {"tools"},
+    "openai/codex-mini": {"tools"},
+    "arcee-ai/caller-large": {"tools"},
+    "arcee-ai/virtuoso-large": {"tools"},
+    "mistralai/magistral-small-2506": {"tools"},
+
+    # --- DeepSeek subset with tools -----------------------------------------
+    "deepseek/deepseek-r1-0528": {"tools"},
+    "deepseek/deepseek-r1-0528-qwen3-8b": set(),  # no tools
+    "deepseek/deepseek-r1-distill-qwen-7b": set(),  # no tools
+    "deepseek/deepseek-r1-0528-qwen3-8b:free": set(),  # no tools
+
+    # --- OSS / “:free” skus (no tool support) -------------------------------
     "mistralai/mixtral-8x7b-instruct": set(),
     "mistralai/mixtral-8x7b-instruct:free": set(),
     "deepseek/deepseek-r1-distill-llama-70b:free": set(),
@@ -67,7 +103,13 @@ MODEL_CAPABILITIES: Dict[str, set[str]] = {
     "nousresearch/nous-capybara-7b:free": set(),
     "gryphe/mythomist-7b:free": set(),
     "undi95/toppy-m-7b:free": set(),
+    "sarvamai/sarvam-m:free": set(),
+    "sentientagi/dobby-mini-unhinged-plus-llama-3.1-8b": set(),
+    "thedrummer/valkyrie-49b-v1": set(),
+    "google/gemma-3n-e4b-it:free": set(),
+    # …and any other entries that lack the `"tools"` string
 }
+
 
 
 def provider_supports_tools(model_name: str) -> bool:
