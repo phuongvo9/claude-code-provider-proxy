@@ -8,6 +8,7 @@ import enum
 import json
 import logging
 import os
+import random
 import sys
 import time
 import traceback
@@ -259,6 +260,8 @@ class LogEvent(enum.Enum):
     PROVIDER_ERROR_DETAILS = "provider_error_details"
     TOOL_CAPABILITY_DOWNGRADE = "tool_capability_downgrade"
     TOOL_RETRY_ATTEMPT = "tool_retry_attempt"
+    CIRCUIT_OPEN = "circuit_open"
+    CIRCUIT_CLOSE = "circuit_close"
 
 
 @dataclasses.dataclass
@@ -1500,29 +1503,42 @@ async def _safe_create_completion_stream(
     """
     Safely create a streaming chat completion with automatic tool stripping retry on 404.
     """
-    try:
-        return await openai_client.chat.completions.create(**params)
-    except openai.NotFoundError as e:
-        if (
-            allow_retry
-            and "support tool use" in str(e).lower()
-        ):
-            warning(
-                LogRecord(
-                    event=LogEvent.TOOL_RETRY_ATTEMPT.value,
-                    message="Retrying streaming request without tool payload after 404 'support tool use' error.",
-                    request_id=request_id,
-                    data={
-                        "original_model": params.get("model"),
-                        "original_error": str(e),
-                    }
-                )
-            )
-            
+    retries = 0
+    while True:
+        # Circuit open? Skip call
+        if is_circuit_open(params["model"].split("/")[0], params["model"]):
+            raise openai.RateLimitError(message=f"Circuit open for {params['model']}; skipping call.")
+        try:
+            resp = await openai_client.chat.completions.create(**params)
+            provider = resp.headers.get("x-provider-name")
+            maybe_close_circuit(provider, params["model"])
+            return resp
+        except openai.RateLimitError as e:
+            provider, retry_hint = parse_provider_and_retry(e)
+            info(LogRecord(
+                event=LogEvent.RATE_LIMIT_HIT.value,
+                message="Hit 429 from upstream",
+                request_id=request_id,
+                data={"provider": provider, "model": params["model"], "retry": retries},
+            ))
+
+            if retries >= MAX_RATE_LIMIT_RETRIES:
+                open_circuit(provider or "unknown", params["model"])
+                raise
+
+            backoff_sec = max(retry_hint, (BACKOFF_BASE_MS/1000.0) * (BACKOFF_EXPONENTIAL_FACTOR ** retries))
+            backoff_sec += random.uniform(0, BACKOFF_JITTER_MS/1000.0)
+            retries += 1
+
+            warning(LogRecord(
+                event=LogEvent.RATE_LIMIT_BACKOFF.value,
+                message=f"Backing off {backoff_sec:.2f}s before retry",
+                request_id=request_id,
+            ))
+            await anyio.sleep(backoff_sec)
+        except openai.NotFoundError as e:
             # Create a copy of params without tool-related keys
             retry_params = {k: v for k, v in params.items() if k not in ("tools", "tool_choice")}
-            
-            # Remove assistant.tool_calls from messages to satisfy OpenAI spec
             if "messages" in retry_params:
                 messages_copy = []
                 for msg in retry_params["messages"]:
@@ -1536,515 +1552,4 @@ async def _safe_create_completion_stream(
                     else:
                         messages_copy.append(msg)
                 retry_params["messages"] = messages_copy
-            
-            # Retry without tools (no further retries allowed)
             return await _safe_create_completion_stream(retry_params, request_id, allow_retry=False)
-        raise
-
-
-app = fastapi.FastAPI(
-    title=settings.app_name,
-    description="Routes Anthropic API requests to an OpenAI-compatible API, selecting models dynamically.",
-    version=settings.app_version,
-    docs_url=None,
-    redoc_url=None,
-)
-
-
-def select_target_model(client_model_name: str, request_id: str) -> str:
-    """Selects the target OpenRouter model based on the client's request."""
-    client_model_lower = client_model_name.lower()
-    target_model: str
-
-    if "opus" in client_model_lower or "sonnet" in client_model_lower:
-        target_model = settings.big_model_name
-    elif "haiku" in client_model_lower:
-        target_model = settings.small_model_name
-    else:
-        target_model = settings.small_model_name
-        warning(
-            LogRecord(
-                event=LogEvent.MODEL_SELECTION.value,
-                message=f"Unknown client model '{client_model_name}', defaulting to SMALL model '{target_model}'.",
-                request_id=request_id,
-                data={
-                    "client_model": client_model_name,
-                    "default_target_model": target_model,
-                },
-            )
-        )
-
-    debug(
-        LogRecord(
-            event=LogEvent.MODEL_SELECTION.value,
-            message=f"Client model '{client_model_name}' mapped to target model '{target_model}'.",
-            request_id=request_id,
-            data={"client_model": client_model_name, "target_model": target_model},
-        )
-    )
-    return target_model
-
-
-def _build_anthropic_error_response(
-    error_type: AnthropicErrorType,
-    message: str,
-    status_code: int,
-    provider_details: Optional[ProviderErrorMetadata] = None,
-) -> JSONResponse:
-    """Creates a JSONResponse with Anthropic-formatted error."""
-    err_detail = AnthropicErrorDetail(type=error_type, message=message)
-    if provider_details:
-        err_detail.provider = provider_details.provider_name
-        if provider_details.raw_error:
-            if isinstance(provider_details.raw_error, dict):
-                prov_err_obj = provider_details.raw_error.get("error")
-                if isinstance(prov_err_obj, dict):
-                    err_detail.provider_message = prov_err_obj.get("message")
-                    err_detail.provider_code = prov_err_obj.get("code")
-                elif isinstance(provider_details.raw_error.get("message"), str):
-                    err_detail.provider_message = provider_details.raw_error.get(
-                        "message"
-                    )
-                    err_detail.provider_code = provider_details.raw_error.get("code")
-
-    error_resp_model = AnthropicErrorResponse(error=err_detail)
-    return JSONResponse(
-        status_code=status_code, content=error_resp_model.model_dump(exclude_unset=True)
-    )
-
-
-async def _log_and_return_error_response(
-    request: Request,
-    status_code: int,
-    anthropic_error_type: AnthropicErrorType,
-    error_message: str,
-    provider_details: Optional[ProviderErrorMetadata] = None,
-    caught_exception: Optional[Exception] = None,
-) -> JSONResponse:
-    request_id = getattr(request.state, "request_id", "unknown")
-    start_time_mono = getattr(request.state, "start_time_monotonic", time.monotonic())
-    duration_ms = (time.monotonic() - start_time_mono) * 1000
-
-    log_data = {
-        "status_code": status_code,
-        "duration_ms": duration_ms,
-        "error_type": anthropic_error_type.value,
-        "client_ip": request.client.host if request.client else "unknown",
-    }
-    if provider_details:
-        log_data["provider_name"] = provider_details.provider_name
-        log_data["provider_raw_error"] = provider_details.raw_error
-
-    error(
-        LogRecord(
-            event=LogEvent.REQUEST_FAILURE.value,
-            message=f"Request failed: {error_message}",
-            request_id=request_id,
-            data=log_data,
-        ),
-        exc=caught_exception,
-    )
-    return _build_anthropic_error_response(
-        anthropic_error_type, error_message, status_code, provider_details
-    )
-
-
-@app.post("/v1/messages", response_model=None, tags=["API"], status_code=200)
-async def create_message_proxy(
-    request: Request,
-) -> Union[JSONResponse, StreamingResponse]:
-    """
-    Main endpoint for Anthropic message completions, proxied to an OpenAI-compatible API.
-    Handles request/response conversions, streaming, and dynamic model selection.
-    """
-    request_id = str(uuid.uuid4())
-    request.state.request_id = request_id
-    request.state.start_time_monotonic = time.monotonic()
-
-    try:
-        raw_body = await request.json()
-        debug(
-            LogRecord(
-                LogEvent.ANTHROPIC_REQUEST.value,
-                "Received Anthropic request body",
-                request_id,
-                {"body": raw_body},
-            )
-        )
-
-        anthropic_request = MessagesRequest.model_validate(
-            raw_body, context={"request_id": request_id}
-        )
-    except json.JSONDecodeError as e:
-        return await _log_and_return_error_response(
-            request,
-            400,
-            AnthropicErrorType.INVALID_REQUEST,
-            "Invalid JSON body.",
-            caught_exception=e,
-        )
-    except ValidationError as e:
-        return await _log_and_return_error_response(
-            request,
-            422,
-            AnthropicErrorType.INVALID_REQUEST,
-            f"Invalid request body: {e.errors()}",
-            caught_exception=e,
-        )
-
-    is_stream = anthropic_request.stream or False
-    target_model_name = select_target_model(anthropic_request.model, request_id)
-
-    estimated_input_tokens = count_tokens_for_anthropic_request(
-        messages=anthropic_request.messages,
-        system=anthropic_request.system,
-        model_name=anthropic_request.model,
-        tools=anthropic_request.tools,
-        request_id=request_id,
-    )
-
-    info(
-        LogRecord(
-            event=LogEvent.REQUEST_START.value,
-            message="Processing new message request",
-            request_id=request_id,
-            data={
-                "client_model": anthropic_request.model,
-                "target_model": target_model_name,
-                "stream": is_stream,
-                "estimated_input_tokens": estimated_input_tokens,
-                "client_ip": request.client.host if request.client else "unknown",
-                "user_agent": request.headers.get("user-agent", "unknown"),
-            },
-        )
-    )
-
-    try:
-        openai_messages = convert_anthropic_to_openai_messages(
-            anthropic_request.messages, anthropic_request.system, request_id=request_id
-        )
-        openai_tools = convert_anthropic_tools_to_openai(anthropic_request.tools)
-        openai_tool_choice = convert_anthropic_tool_choice_to_openai(
-            anthropic_request.tool_choice, request_id
-        )
-    except Exception as e:
-        return await _log_and_return_error_response(
-            request,
-            500,
-            AnthropicErrorType.API_ERROR,
-            "Error during request conversion.",
-            caught_exception=e,
-        )
-
-    openai_params: Dict[str, Any] = {
-        "model": target_model_name,
-        "messages": cast(List[ChatCompletionMessageParam], openai_messages),
-        "max_tokens": anthropic_request.max_tokens,
-        "stream": is_stream,
-    }
-    if anthropic_request.temperature is not None:
-        openai_params["temperature"] = anthropic_request.temperature
-    if anthropic_request.top_p is not None:
-        openai_params["top_p"] = anthropic_request.top_p
-    if anthropic_request.stop_sequences:
-        openai_params["stop"] = anthropic_request.stop_sequences
-    
-    # -------------------------------------------------------------------
-    # C. Inject tools ONLY if the chosen provider supports them
-    # -------------------------------------------------------------------
-    if openai_tools and provider_supports_tools(target_model_name):
-        openai_params["tools"] = cast(
-            Optional[List[ChatCompletionToolParam]], openai_tools
-        )
-        if openai_tool_choice:
-            openai_params["tool_choice"] = openai_tool_choice
-    else:
-        # Capability downgrade - log it for observability
-        if openai_tools:
-            debug(
-                LogRecord(
-                    event=LogEvent.TOOL_CAPABILITY_DOWNGRADE.value,
-                    message=f"Stripping tool payload for model '{target_model_name}' - model does not support tools",
-                    request_id=request_id,
-                    data={
-                        "target_model": target_model_name,
-                        "supports_tools": False,
-                        "tool_count": len(openai_tools),
-                    },
-                )
-            )
-    
-    if anthropic_request.metadata and anthropic_request.metadata.get("user_id"):
-        openai_params["user"] = str(anthropic_request.metadata.get("user_id"))
-
-    debug(
-        LogRecord(
-            LogEvent.OPENAI_REQUEST.value,
-            "Prepared OpenAI request parameters",
-            request_id,
-            {"params": openai_params},
-        )
-    )
-
-    try:
-        if is_stream:
-            debug(
-                LogRecord(
-                    LogEvent.STREAMING_REQUEST.value,
-                    "Initiating streaming request to OpenAI-compatible API",
-                    request_id,
-                )
-            )
-            openai_stream_response = await _safe_create_completion_stream(
-                openai_params, request_id
-            )
-            return StreamingResponse(
-                handle_anthropic_streaming_response_from_openai_stream(
-                    openai_stream_response,
-                    anthropic_request.model,
-                    estimated_input_tokens,
-                    request_id,
-                    request.state.start_time_monotonic,
-                ),
-                media_type="text/event-stream",
-            )
-        else:
-            debug(
-                LogRecord(
-                    LogEvent.OPENAI_REQUEST.value,
-                    "Sending non-streaming request to OpenAI-compatible API",
-                    request_id,
-                )
-            )
-            openai_response_obj = await _safe_create_completion(
-                openai_params, request_id
-            )
-
-            debug(
-                LogRecord(
-                    LogEvent.OPENAI_RESPONSE.value,
-                    "Received OpenAI response",
-                    request_id,
-                    {"response": openai_response_obj.model_dump()},
-                )
-            )
-
-            anthropic_response_obj = convert_openai_to_anthropic_response(
-                openai_response_obj, anthropic_request.model, request_id=request_id
-            )
-            duration_ms = (time.monotonic() - request.state.start_time_monotonic) * 1000
-            info(
-                LogRecord(
-                    event=LogEvent.REQUEST_COMPLETED.value,
-                    message="Non-streaming request completed successfully",
-                    request_id=request_id,
-                    data={
-                        "status_code": 200,
-                        "duration_ms": duration_ms,
-                        "input_tokens": anthropic_response_obj.usage.input_tokens,
-                        "output_tokens": anthropic_response_obj.usage.output_tokens,
-                        "stop_reason": anthropic_response_obj.stop_reason,
-                    },
-                )
-            )
-            debug(
-                LogRecord(
-                    LogEvent.ANTHROPIC_RESPONSE.value,
-                    "Prepared Anthropic response",
-                    request_id,
-                    {"response": anthropic_response_obj.model_dump(exclude_unset=True)},
-                )
-            )
-            return JSONResponse(
-                content=anthropic_response_obj.model_dump(exclude_unset=True)
-            )
-
-    except openai.APIError as e:
-        err_type, err_msg, err_status, prov_details = (
-            _get_anthropic_error_details_from_exc(e)
-        )
-        return await _log_and_return_error_response(
-            request, err_status, err_type, err_msg, prov_details, e
-        )
-    except Exception as e:
-        return await _log_and_return_error_response(
-            request,
-            500,
-            AnthropicErrorType.API_ERROR,
-            "An unexpected error occurred while processing the request.",
-            caught_exception=e,
-        )
-
-
-@app.post(
-    "/v1/messages/count_tokens", response_model=TokenCountResponse, tags=["Utility"]
-)
-async def count_tokens_endpoint(request: Request) -> TokenCountResponse:
-    """Estimates token count for given Anthropic messages and system prompt."""
-    request_id = str(uuid.uuid4())
-    request.state.request_id = request_id
-    start_time_mono = time.monotonic()
-
-    try:
-        body = await request.json()
-        count_request = TokenCountRequest.model_validate(body)
-    except json.JSONDecodeError as e:
-        raise fastapi.HTTPException(status_code=400, detail="Invalid JSON body.") from e
-    except ValidationError as e:
-        raise fastapi.HTTPException(
-            status_code=422, detail=f"Invalid request body: {e.errors()}"
-        ) from e
-
-    token_count = count_tokens_for_anthropic_request(
-        messages=count_request.messages,
-        system=count_request.system,
-        model_name=count_request.model,
-        tools=count_request.tools,
-        request_id=request_id,
-    )
-    duration_ms = (time.monotonic() - start_time_mono) * 1000
-    info(
-        LogRecord(
-            event=LogEvent.TOKEN_COUNT.value,
-            message=f"Counted {token_count} tokens",
-            request_id=request_id,
-            data={
-                "duration_ms": duration_ms,
-                "token_count": token_count,
-                "model": count_request.model,
-            },
-        )
-    )
-    return TokenCountResponse(input_tokens=token_count)
-
-
-@app.get("/", include_in_schema=False, tags=["Health"])
-async def root_health_check() -> JSONResponse:
-    """Basic health check and information endpoint."""
-    debug(
-        LogRecord(
-            event=LogEvent.HEALTH_CHECK.value, message="Root health check accessed"
-        )
-    )
-    return JSONResponse(
-        {
-            "proxy_name": settings.app_name,
-            "version": settings.app_version,
-            "status": "ok",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-
-
-@app.exception_handler(openai.APIError)
-async def openai_api_error_handler(request: Request, exc: openai.APIError):
-    err_type, err_msg, err_status, prov_details = _get_anthropic_error_details_from_exc(
-        exc
-    )
-    return await _log_and_return_error_response(
-        request, err_status, err_type, err_msg, prov_details, exc
-    )
-
-
-@app.exception_handler(ValidationError)
-async def pydantic_validation_error_handler(request: Request, exc: ValidationError):
-    return await _log_and_return_error_response(
-        request,
-        422,
-        AnthropicErrorType.INVALID_REQUEST,
-        f"Validation error: {exc.errors()}",
-        caught_exception=exc,
-    )
-
-
-@app.exception_handler(json.JSONDecodeError)
-async def json_decode_error_handler(request: Request, exc: json.JSONDecodeError):
-    return await _log_and_return_error_response(
-        request,
-        400,
-        AnthropicErrorType.INVALID_REQUEST,
-        "Invalid JSON format.",
-        caught_exception=exc,
-    )
-
-
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    return await _log_and_return_error_response(
-        request,
-        500,
-        AnthropicErrorType.API_ERROR,
-        "An unexpected internal server error occurred.",
-        caught_exception=exc,
-    )
-
-
-@app.middleware("http")
-async def logging_middleware(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]
-) -> Response:
-    if not hasattr(request.state, "request_id"):
-        request.state.request_id = str(uuid.uuid4())
-    if not hasattr(request.state, "start_time_monotonic"):
-        request.state.start_time_monotonic = time.monotonic()
-
-    response = await call_next(request)
-
-    response.headers["X-Request-ID"] = request.state.request_id
-    duration_ms = (time.monotonic() - request.state.start_time_monotonic) * 1000
-    response.headers["X-Response-Time-ms"] = str(duration_ms)
-
-    return response
-
-
-if __name__ == "__main__":
-    _console.print(
-        r"""[bold blue]
-           /$$                           /$$
-          | $$                          | $$
-  /$$$$$$$| $$  /$$$$$$  /$$   /$$  /$$$$$$$  /$$$$$$         /$$$$$$   /$$$$$$   /$$$$$$  /$$   /$$ /$$   /$$
- /$$_____/| $$ |____  $$| $$  | $$ /$$__  $$ /$$__  $$       /$$__  $$ /$$__  $$ /$$__  $$|  $$ /$$/| $$  | $$
-| $$      | $$  /$$$$$$$| $$  | $$| $$  | $$| $$$$$$$$      | $$  \ $$| $$  \__/| $$  \ $$ \  $$$$/ | $$  | $$
-| $$      | $$ /$$__  $$| $$  | $$| $$  | $$| $$_____/      | $$  | $$| $$      | $$  | $$  >$$  $$ | $$  | $$
-|  $$$$$$$| $$|  $$$$$$$|  $$$$$$/|  $$$$$$$|  $$$$$$$      | $$$$$$$/| $$      |  $$$$$$/ /$$/\  $$|  $$$$$$$
- \_______/|__/ \_______/ \______/  \_______/ \_______/      | $$____/ |__/       \______/ |__/  \__/ \____  $$
-                                                            | $$                                     /$$  | $$
-                                                            | $$                                    |  $$$$$$/
-                                                            |__/                                     \______/ 
-    [/]""",
-        justify="left",
-    )
-    config_details_text = Text.assemble(
-        ("   Version       : ", "default"),
-        (f"v{settings.app_version}", "bold cyan"),
-        ("\n   Big Model     : ", "default"),
-        (settings.big_model_name, "magenta"),
-        ("\n   Small Model   : ", "default"),
-        (settings.small_model_name, "green"),
-        ("\n   Log Level     : ", "default"),
-        (settings.log_level.upper(), "yellow"),
-        ("\n   Log File      : ", "default"),
-        (settings.log_file_path or "Disabled", "dim"),
-        ("\n   Listening on  : ", "default"),
-        (f"http://{settings.host}:{settings.port}", "bold white"),
-        ("\n   Reload        : ", "default"),
-        ("Enabled", "bold orange1") if settings.reload else ("Disabled", "dim"),
-    )
-    _console.print(
-        Panel(
-            config_details_text,
-            title="Anthropic Proxy Configuration",
-            border_style="blue",
-            expand=False,
-        )
-    )
-    _console.print(Rule("Starting Uvicorn server...", style="dim blue"))
-
-    uvicorn.run(
-        "__main__:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.reload,
-        log_config=None,
-        access_log=False,
-    )
