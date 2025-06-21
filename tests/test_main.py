@@ -1,9 +1,6 @@
 import importlib
-
 import pytest
-
 import main
-
 
 @pytest.mark.parametrize(
     ("client_model", "expected"),
@@ -16,7 +13,6 @@ import main
 def test_select_target_model(monkeypatch, main_module, client_model, expected):
     res = main_module.select_target_model(client_model, request_id="r1")
     assert res == expected  # model routing logic
-
 
 def test_count_tokens_basic(main_module):
     msg = main_module.Message(role="user", content="hello")
