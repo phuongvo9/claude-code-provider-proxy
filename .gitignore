@@ -1,6 +1,8 @@
 # PV
 .credentials/.env.credentials
-
+log.json 
+/.env*
+.env**
 #
 # Byte-compiled / optimized / DLL files
 __pycache__/
