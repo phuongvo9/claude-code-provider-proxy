@@ -35,6 +35,45 @@ from rich.text import Text
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# A. Declarative capability map (extendable via env or YAML)
+# ---------------------------------------------------------------------------
+MODEL_CAPABILITIES: Dict[str, set[str]] = {
+    # OpenAI family – all support tools
+    "gpt-4o": {"tools"},
+    "gpt-4o-mini": {"tools"},
+    "gpt-4": {"tools"},
+    "gpt-4-turbo": {"tools"},
+    "gpt-3.5-turbo": {"tools"},
+    
+    # Anthropic variants on OpenRouter that DO support tools
+    "anthropic/claude-3-opus:beta": {"tools"},
+    "anthropic/claude-3-opus": {"tools"},
+    "anthropic/claude-3-sonnet": {"tools"},
+    "anthropic/claude-3-haiku": {"tools"},
+    "anthropic/claude-3.5-sonnet": {"tools"},
+    "anthropic/claude-3.5-haiku": {"tools"},
+    
+    # OSS & :free SKUs – no tool support
+    "mistralai/mixtral-8x7b-instruct": set(),
+    "mistralai/mixtral-8x7b-instruct:free": set(),
+    "deepseek/deepseek-r1-distill-llama-70b:free": set(),
+    "meta-llama/llama-3.2-3b-instruct:free": set(),
+    "meta-llama/llama-3.2-1b-instruct:free": set(),
+    "microsoft/phi-3-mini-128k-instruct:free": set(),
+    "google/gemma-2-9b-it:free": set(),
+    "huggingfaceh4/zephyr-7b-beta:free": set(),
+    "openchat/openchat-7b:free": set(),
+    "nousresearch/nous-capybara-7b:free": set(),
+    "gryphe/mythomist-7b:free": set(),
+    "undi95/toppy-m-7b:free": set(),
+}
+
+
+def provider_supports_tools(model_name: str) -> bool:
+    """Return True if this model exposes the function-call / tool API."""
+    return "tools" in MODEL_CAPABILITIES.get(model_name, set())
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -172,6 +211,8 @@ class LogEvent(enum.Enum):
     PARAMETER_UNSUPPORTED = "parameter_unsupported"
     HEALTH_CHECK = "health_check"
     PROVIDER_ERROR_DETAILS = "provider_error_details"
+    TOOL_CAPABILITY_DOWNGRADE = "tool_capability_downgrade"
+    TOOL_RETRY_ATTEMPT = "tool_retry_attempt"
 
 
 @dataclasses.dataclass
@@ -1355,6 +1396,106 @@ async def handle_anthropic_streaming_response_from_openai_stream(
             )
 
 
+async def _safe_create_completion(
+    params: Dict[str, Any], 
+    request_id: str,
+    allow_retry: bool = True
+) -> openai.types.chat.ChatCompletion:
+    """
+    Safely create a chat completion with automatic tool stripping retry on 404.
+    """
+    try:
+        return await openai_client.chat.completions.create(**params)
+    except openai.NotFoundError as e:
+        if (
+            allow_retry
+            and "support tool use" in str(e).lower()
+        ):
+            warning(
+                LogRecord(
+                    event=LogEvent.TOOL_RETRY_ATTEMPT.value,
+                    message="Retrying without tool payload after 404 'support tool use' error.",
+                    request_id=request_id,
+                    data={
+                        "original_model": params.get("model"),
+                        "original_error": str(e),
+                    }
+                )
+            )
+            
+            # Create a copy of params without tool-related keys
+            retry_params = {k: v for k, v in params.items() if k not in ("tools", "tool_choice")}
+            
+            # Remove assistant.tool_calls from messages to satisfy OpenAI spec
+            if "messages" in retry_params:
+                messages_copy = []
+                for msg in retry_params["messages"]:
+                    if isinstance(msg, dict):
+                        msg_copy = msg.copy()
+                        if msg_copy.get("role") == "assistant" and "tool_calls" in msg_copy:
+                            msg_copy.pop("tool_calls")
+                            if not msg_copy.get("content"):
+                                msg_copy["content"] = ""
+                        messages_copy.append(msg_copy)
+                    else:
+                        messages_copy.append(msg)
+                retry_params["messages"] = messages_copy
+            
+            # Retry without tools (no further retries allowed)
+            return await _safe_create_completion(retry_params, request_id, allow_retry=False)
+        raise
+
+
+async def _safe_create_completion_stream(
+    params: Dict[str, Any], 
+    request_id: str,
+    allow_retry: bool = True
+) -> openai.AsyncStream[openai.types.chat.ChatCompletionChunk]:
+    """
+    Safely create a streaming chat completion with automatic tool stripping retry on 404.
+    """
+    try:
+        return await openai_client.chat.completions.create(**params)
+    except openai.NotFoundError as e:
+        if (
+            allow_retry
+            and "support tool use" in str(e).lower()
+        ):
+            warning(
+                LogRecord(
+                    event=LogEvent.TOOL_RETRY_ATTEMPT.value,
+                    message="Retrying streaming request without tool payload after 404 'support tool use' error.",
+                    request_id=request_id,
+                    data={
+                        "original_model": params.get("model"),
+                        "original_error": str(e),
+                    }
+                )
+            )
+            
+            # Create a copy of params without tool-related keys
+            retry_params = {k: v for k, v in params.items() if k not in ("tools", "tool_choice")}
+            
+            # Remove assistant.tool_calls from messages to satisfy OpenAI spec
+            if "messages" in retry_params:
+                messages_copy = []
+                for msg in retry_params["messages"]:
+                    if isinstance(msg, dict):
+                        msg_copy = msg.copy()
+                        if msg_copy.get("role") == "assistant" and "tool_calls" in msg_copy:
+                            msg_copy.pop("tool_calls")
+                            if not msg_copy.get("content"):
+                                msg_copy["content"] = ""
+                        messages_copy.append(msg_copy)
+                    else:
+                        messages_copy.append(msg)
+                retry_params["messages"] = messages_copy
+            
+            # Retry without tools (no further retries allowed)
+            return await _safe_create_completion_stream(retry_params, request_id, allow_retry=False)
+        raise
+
+
 app = fastapi.FastAPI(
     title=settings.app_name,
     description="Routes Anthropic API requests to an OpenAI-compatible API, selecting models dynamically.",
@@ -1561,12 +1702,32 @@ async def create_message_proxy(
         openai_params["top_p"] = anthropic_request.top_p
     if anthropic_request.stop_sequences:
         openai_params["stop"] = anthropic_request.stop_sequences
-    if openai_tools:
+    
+    # -------------------------------------------------------------------
+    # C. Inject tools ONLY if the chosen provider supports them
+    # -------------------------------------------------------------------
+    if openai_tools and provider_supports_tools(target_model_name):
         openai_params["tools"] = cast(
             Optional[List[ChatCompletionToolParam]], openai_tools
         )
-    if openai_tool_choice:
-        openai_params["tool_choice"] = openai_tool_choice
+        if openai_tool_choice:
+            openai_params["tool_choice"] = openai_tool_choice
+    else:
+        # Capability downgrade - log it for observability
+        if openai_tools:
+            debug(
+                LogRecord(
+                    event=LogEvent.TOOL_CAPABILITY_DOWNGRADE.value,
+                    message=f"Stripping tool payload for model '{target_model_name}' - model does not support tools",
+                    request_id=request_id,
+                    data={
+                        "target_model": target_model_name,
+                        "supports_tools": False,
+                        "tool_count": len(openai_tools),
+                    },
+                )
+            )
+    
     if anthropic_request.metadata and anthropic_request.metadata.get("user_id"):
         openai_params["user"] = str(anthropic_request.metadata.get("user_id"))
 
@@ -1588,8 +1749,8 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            openai_stream_response = await openai_client.chat.completions.create(
-                **openai_params
+            openai_stream_response = await _safe_create_completion_stream(
+                openai_params, request_id
             )
             return StreamingResponse(
                 handle_anthropic_streaming_response_from_openai_stream(
@@ -1609,8 +1770,8 @@ async def create_message_proxy(
                     request_id,
                 )
             )
-            openai_response_obj = await openai_client.chat.completions.create(
-                **openai_params
+            openai_response_obj = await _safe_create_completion(
+                openai_params, request_id
             )
 
             debug(
