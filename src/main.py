@@ -90,6 +90,11 @@ MODEL_CAPABILITIES: Dict[str, set[str]] = {
     "deepseek/deepseek-r1-distill-qwen-7b": set(),  # no tools
     "deepseek/deepseek-r1-0528-qwen3-8b:free": set(),  # no tools
 
+    # --- Qwen subset with tools ---------------------------------------------
+    "qwen/qwen3-235b-a22b": {"tools"},
+    "qwen/qwen3-30b-a3b": {"tools"},
+    "qwen/qwq-32b": {"tools"},
+
     # --- OSS / “:free” skus (no tool support) -------------------------------
     "mistralai/mixtral-8x7b-instruct": set(),
     "mistralai/mixtral-8x7b-instruct:free": set(),
@@ -107,7 +112,6 @@ MODEL_CAPABILITIES: Dict[str, set[str]] = {
     "sentientagi/dobby-mini-unhinged-plus-llama-3.1-8b": set(),
     "thedrummer/valkyrie-49b-v1": set(),
     "google/gemma-3n-e4b-it:free": set(),
-    # …and any other entries that lack the `"tools"` string
 }
 
 
