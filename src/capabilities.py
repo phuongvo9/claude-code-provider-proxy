@@ -216,7 +216,15 @@ def provider_supports_tools(model_name: str) -> bool | None:
     # Check capabilities from loaded model data
     caps = get_model_capabilities()
     if model_name in caps:
-        return "tools" in caps[model_name]
+        # If the model has "tools" in its capability set, it supports tools
+        if "tools" in caps[model_name]:
+            return True
+        # If the model is explicitly in the caps but has no tools, it doesn't support them
+        # (This handles cases where we explicitly mark models as non-tool-capable)
+        if caps[model_name] == set():
+            return False
+        # Feed is silent about tools ➜ unknown
+        return None
     
     # Check if model matches any tool-capable prefix
     m = model_name.lower()

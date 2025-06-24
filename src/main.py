@@ -375,7 +375,8 @@ class MessagesRequest(BaseModel):
         """
         model_name: str = info.data.get("model", "")
         # remove tools only for providers we *know* can't accept them
-        if v and provider_supports_tools(model_name) is False:
+        should_strip = provider_supports_tools(model_name) is False
+        if v and should_strip:
             req_id = info.context.get("request_id") if info.context else None
             warning(
                 LogRecord(

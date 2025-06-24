@@ -31,9 +31,10 @@ def execute_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         elif name == "execute_command":
             return _execute_command(arguments)
         else:
+            log.warning("Requested unknown tool: %s", name)
             return {
                 "success": False,
-                "error": f"Unknown tool: {name}",
+                "error": f"Tool '{name}' not implemented",
                 "result": None
             }
     except Exception as e:
