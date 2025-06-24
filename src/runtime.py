@@ -174,3 +174,11 @@ def extract_multiple_tool_calls(
 def is_tool_call_response(response: Dict[str, Any]) -> bool:
     """Check if a response contains a tool call."""
     return extract_tool_call(response) is not None
+
+
+def is_tool_call_response(msg: dict) -> bool:
+    """True if the assistant message contains a structured tool call."""
+    return (
+        "tool_calls" in msg
+        or ("function_call" in msg and msg["function_call"] is not None)
+    )

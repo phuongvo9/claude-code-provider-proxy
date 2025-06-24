@@ -130,27 +130,37 @@ class TestToolSystem:
 
     def test_is_tool_call_response(self):
         """Test detecting tool call responses."""
-        # Response with tool call
-        tool_response = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": '{"tool": "web_search", "arguments": {"query": "test"}}'
-                }
+        # Response with native tool call
+        native_msg = {
+            "role": "assistant",
+            "tool_calls": [{
+                "type": "function",
+                "function": {"name": "web_search", "arguments": '{"query": "test"}'}
             }]
         }
-        assert is_tool_call_response(tool_response) is True
+        assert is_tool_call_response(native_msg) is True
+        
+        # Response with function_call
+        function_call_msg = {
+            "role": "assistant",
+            "function_call": {"name": "web_search", "arguments": '{"query": "test"}'}
+        }
+        assert is_tool_call_response(function_call_msg) is True
+        
+        # Response with function_call None (should be False)
+        null_function_call_msg = {
+            "role": "assistant",
+            "function_call": None,
+            "content": "Just a regular response"
+        }
+        assert is_tool_call_response(null_function_call_msg) is False
         
         # Response without tool call
-        text_response = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "This is just a regular text response."
-                }
-            }]
+        text_msg = {
+            "role": "assistant",
+            "content": "This is just a regular text response."
         }
-        assert is_tool_call_response(text_response) is False
+        assert is_tool_call_response(text_msg) is False
 
     def test_tool_execution_web_search(self):
         """Test web search tool execution."""
@@ -235,6 +245,16 @@ class TestToolSystem:
             "choices": [{"message": {"role": "assistant", "content": "OK", "function_call": {}}}]
         }
         assert extract_tool_call(reply_with_empty) is None
+
+    def test_tool_choice_auto(self):
+        """Test that tool_choice auto is added for tool-capable models."""
+        from src.llm_client import prepare_chat_request
+        payload = prepare_chat_request(
+            "gemini-flash-preview",
+            [{"role": "user", "content": "Run `ls` in the repo"}],
+        )
+        assert payload["tool_choice"] == "auto"
+        assert any(t["function"]["name"] == "execute_command" for t in payload["tools"])
 
 
 class TestToolExecutor:

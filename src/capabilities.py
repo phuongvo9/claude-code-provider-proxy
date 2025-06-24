@@ -183,9 +183,9 @@ TOOL_CAPABLE_PREFIXES = (
     # Anthropic Claude
     "claude", "anthropic/",
     # Google Gemini family (tool-calling in JSON spec)
-    "google/gemini", "gemini",
+    "google/gemini", "gemini", "gemini-",
     # DeepSeek-V3 exposes function calling behind OpenAI API
-    "deepseek-llm", "deepseek/",
+    "deepseek-llm", "deepseek/", "deepseek-",
     # Mistral & variants
     "mistralai/", "mistral/",
     # Meta models

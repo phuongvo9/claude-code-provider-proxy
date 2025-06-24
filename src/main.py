@@ -1776,7 +1776,12 @@ async def create_message_proxy(
 
             # Check for tool calls using the new runtime system
             openai_response_dict = openai_response_obj.model_dump()
-            tool_call = extract_tool_call(openai_response_dict)
+            first_msg = openai_response_dict.get("choices", [{}])[0].get("message", {})
+            
+            if is_tool_call_response(first_msg):
+                tool_call = extract_tool_call(openai_response_dict)
+            else:
+                tool_call = None
             
             if tool_call:
                 # Execute the tool call
