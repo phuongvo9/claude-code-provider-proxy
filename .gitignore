@@ -3,7 +3,7 @@
 log.json 
 /.env*
 .env**
-local/*.md
+local/*
 #
 # Byte-compiled / optimized / DLL files
 __pycache__/
