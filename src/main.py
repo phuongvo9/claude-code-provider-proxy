@@ -26,7 +26,13 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai.types.chat import (ChatCompletionMessageParam,
                                ChatCompletionToolParam)
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    ConfigDict,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
 from rich.panel import Panel
@@ -305,9 +311,23 @@ class Message(BaseModel):
 
 
 class Tool(BaseModel):
+    """
+    Anthropic/Gemini tool declaration.
+
+    * `input_schema` is now **optional** – some providers send an empty stub.
+    * `model_config.populate_by_name = True` lets Pydantic accept either
+      `input_schema` or its alias when round-tripping.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str
     description: Optional[str] = None
-    input_schema: Dict[str, Any] = Field(..., alias="input_schema")
+    input_schema: Dict[str, Any] = Field(
+        default_factory=dict,  # tolerate missing field
+        alias="input_schema",
+        description="JSON-Schema of the tool arguments; empty when provider omits it.",
+    )
 
 
 class ToolChoice(BaseModel):
@@ -330,7 +350,7 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[ToolChoice] = None
 
     @field_validator("top_k")
-    def check_top_k(cls, v: Optional[int]) -> Optional[int]:
+    def check_top_k(cls, v: Optional[int], info) -> Optional[int]:
         if v is not None:
             req_id = info.context.get("request_id") if info.context else None
             warning(
@@ -341,6 +361,26 @@ class MessagesRequest(BaseModel):
                     data={"parameter": "top_k", "value": v},
                 )
             )
+        return v
+
+    @field_validator("tools", mode="after")
+    def _strip_unsupported_tools(cls, v, info):
+        """
+        Drop tool payloads when the chosen provider doesn't expose the tool API,
+        to avoid 422s downstream while still logging the downgrade.
+        """
+        model_name: str = info.data.get("model", "")
+        if v and not provider_supports_tools(model_name):
+            req_id = info.context.get("request_id") if info.context else None
+            warning(
+                LogRecord(
+                    event=LogEvent.TOOL_CAPABILITY_DOWNGRADE.value,
+                    message=f"Provider for model '{model_name}' does not support tools – payload removed.",
+                    request_id=req_id,
+                    data={"model": model_name, "tool_count": len(v)},
+                )
+            )
+            return None
         return v
 
 
@@ -589,18 +629,20 @@ def count_tokens_for_anthropic_request(
             total_tokens += len(enc.encode(tool.name))
             if tool.description:
                 total_tokens += len(enc.encode(tool.description))
-            try:
-                schema_str = json.dumps(tool.input_schema)
-                total_tokens += len(enc.encode(schema_str))
-            except Exception:
-                warning(
-                    LogRecord(
-                        event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
-                        message="Failed to serialize tool schema for token counting.",
-                        data={"tool_name": tool.name},
-                        request_id=request_id,
+            # Count schema tokens **only** when a schema is present
+            if tool.input_schema:
+                try:
+                    schema_str = json.dumps(tool.input_schema)
+                    total_tokens += len(enc.encode(schema_str))
+                except Exception:
+                    warning(
+                        LogRecord(
+                            event=LogEvent.TOOL_INPUT_SERIALIZATION_FAILURE.value,
+                            message="Failed to serialize tool schema for token counting.",
+                            data={"tool_name": tool.name},
+                            request_id=request_id,
+                        )
                     )
-                )
     debug(
         LogRecord(
             event=LogEvent.TOKEN_COUNT.value,
