@@ -39,8 +39,12 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-# Import the new capabilities module
+# Import the new capabilities module and tool system
 from capabilities import provider_supports_tools, get_model_capabilities
+from llm_client import prepare_chat_request, should_use_structured_tools  
+from runtime import extract_tool_call, extract_multiple_tool_calls, is_tool_call_response
+from tool_executor import execute_tool
+from tools import BASE_TOOLS, get_tool_by_name, get_all_tool_names
 
 load_dotenv()
 
@@ -1688,13 +1692,27 @@ async def create_message_proxy(
     )
 
     try:
+        # Use the new model-agnostic tool system
         openai_messages = convert_anthropic_to_openai_messages(
             anthropic_request.messages, anthropic_request.system, request_id=request_id
         )
-        openai_tools = convert_anthropic_tools_to_openai(anthropic_request.tools)
-        openai_tool_choice = convert_anthropic_tool_choice_to_openai(
-            anthropic_request.tool_choice, request_id
+        
+        # Prepare the request using the new tool-aware system
+        openai_params = prepare_chat_request(
+            model=target_model_name,
+            messages=openai_messages,
+            tools=BASE_TOOLS if anthropic_request.tools else None,
+            max_tokens=anthropic_request.max_tokens,
+            stream=is_stream,
+            temperature=anthropic_request.temperature,
+            top_p=anthropic_request.top_p,
+            stop=anthropic_request.stop_sequences,
         )
+        
+        # Add user metadata if provided
+        if anthropic_request.metadata and anthropic_request.metadata.get("user_id"):
+            openai_params["user"] = str(anthropic_request.metadata.get("user_id"))
+            
     except Exception as e:
         return await _log_and_return_error_response(
             request,
@@ -1703,47 +1721,6 @@ async def create_message_proxy(
             "Error during request conversion.",
             caught_exception=e,
         )
-
-    openai_params: Dict[str, Any] = {
-        "model": target_model_name,
-        "messages": cast(List[ChatCompletionMessageParam], openai_messages),
-        "max_tokens": anthropic_request.max_tokens,
-        "stream": is_stream,
-    }
-    if anthropic_request.temperature is not None:
-        openai_params["temperature"] = anthropic_request.temperature
-    if anthropic_request.top_p is not None:
-        openai_params["top_p"] = anthropic_request.top_p
-    if anthropic_request.stop_sequences:
-        openai_params["stop"] = anthropic_request.stop_sequences
-    
-    # -------------------------------------------------------------------
-    # C. Inject tools ONLY if the chosen provider supports them
-    # -------------------------------------------------------------------
-    if openai_tools and provider_supports_tools(target_model_name):
-        openai_params["tools"] = cast(
-            Optional[List[ChatCompletionToolParam]], openai_tools
-        )
-        if openai_tool_choice:
-            openai_params["tool_choice"] = openai_tool_choice
-    else:
-        # Capability downgrade - log it for observability
-        if openai_tools:
-            debug(
-                LogRecord(
-                    event=LogEvent.TOOL_CAPABILITY_DOWNGRADE.value,
-                    message=f"Stripping tool payload for model '{target_model_name}' - model does not support tools",
-                    request_id=request_id,
-                    data={
-                        "target_model": target_model_name,
-                        "supports_tools": False,
-                        "tool_count": len(openai_tools),
-                    },
-                )
-            )
-    
-    if anthropic_request.metadata and anthropic_request.metadata.get("user_id"):
-        openai_params["user"] = str(anthropic_request.metadata.get("user_id"))
 
     debug(
         LogRecord(
@@ -1797,9 +1774,88 @@ async def create_message_proxy(
                 )
             )
 
-            anthropic_response_obj = convert_openai_to_anthropic_response(
-                openai_response_obj, anthropic_request.model, request_id=request_id
-            )
+            # Check for tool calls using the new runtime system
+            openai_response_dict = openai_response_obj.model_dump()
+            tool_call = extract_tool_call(openai_response_dict)
+            
+            if tool_call:
+                # Execute the tool call
+                debug(
+                    LogRecord(
+                        event="tool_call_detected",
+                        message=f"Executing tool call: {tool_call['name']}",
+                        request_id=request_id,
+                        data={"tool_call": tool_call},
+                    )
+                )
+                
+                try:
+                    tool_result = execute_tool(tool_call["name"], tool_call["arguments"])
+                    
+                    # Create a tool result response in Anthropic format
+                    tool_use_content = ContentBlockToolUse(
+                        type="tool_use",
+                        id=f"toolu_{uuid.uuid4().hex[:8]}",
+                        name=tool_call["name"],
+                        input=tool_call["arguments"]
+                    )
+                    
+                    tool_result_content = ContentBlockToolResult(
+                        type="tool_result",
+                        tool_use_id=tool_use_content.id,
+                        content=json.dumps(tool_result) if tool_result["success"] else f"Error: {tool_result['error']}",
+                        is_error=not tool_result["success"]
+                    )
+                    
+                    # Create Anthropic response with tool use and result
+                    anthropic_response_obj = MessagesResponse(
+                        id=f"msg_{openai_response_obj.id}" if openai_response_obj.id else f"msg_{request_id}_tool_call",
+                        type="message",
+                        role="assistant",
+                        model=anthropic_request.model,
+                        content=[tool_use_content, tool_result_content],
+                        stop_reason="tool_use",
+                        usage=Usage(
+                            input_tokens=openai_response_obj.usage.prompt_tokens if openai_response_obj.usage else 0,
+                            output_tokens=openai_response_obj.usage.completion_tokens if openai_response_obj.usage else 0,
+                        )
+                    )
+                    
+                    debug(
+                        LogRecord(
+                            event="tool_execution_completed",
+                            message=f"Tool {tool_call['name']} executed successfully",
+                            request_id=request_id,
+                            data={"tool_result": tool_result},
+                        )
+                    )
+                    
+                except Exception as tool_exc:
+                    error(
+                        LogRecord(
+                            event="tool_execution_failed",
+                            message=f"Failed to execute tool {tool_call['name']}",
+                            request_id=request_id,
+                            data={"tool_call": tool_call},
+                        ),
+                        exc=tool_exc,
+                    )
+                    
+                    # Return error response
+                    return await _log_and_return_error_response(
+                        request,
+                        500,
+                        AnthropicErrorType.API_ERROR,
+                        f"Tool execution failed: {str(tool_exc)}",
+                        caught_exception=tool_exc,
+                    )
+                
+            else:
+                # Standard response conversion (no tool call)
+                anthropic_response_obj = convert_openai_to_anthropic_response(
+                    openai_response_obj, anthropic_request.model, request_id=request_id
+                )
+
             duration_ms = (time.monotonic() - request.state.start_time_monotonic) * 1000
             info(
                 LogRecord(
@@ -1812,6 +1868,7 @@ async def create_message_proxy(
                         "input_tokens": anthropic_response_obj.usage.input_tokens,
                         "output_tokens": anthropic_response_obj.usage.output_tokens,
                         "stop_reason": anthropic_response_obj.stop_reason,
+                        "had_tool_call": tool_call is not None,
                     },
                 )
             )

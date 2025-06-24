@@ -178,28 +178,60 @@ def _get_capabilities_cached() -> dict[str, set[str]]:
 
 # Providers that ARE tool-capable (prefix match, case-insensitive)
 TOOL_CAPABLE_PREFIXES = (
-    "gpt-", "openai/",           # OpenAI
-    "claude", "anthropic/",      # Anthropic
-    "google/gemini", "gemini",   # Google Gemini flash/pro/ultra
+    # OpenAI & derivatives
+    "gpt-", "openai/",
+    # Anthropic Claude
+    "claude", "anthropic/",
+    # Google Gemini family (tool-calling in JSON spec)
+    "google/gemini", "gemini",
+    # DeepSeek-V3 exposes function calling behind OpenAI API
+    "deepseek-llm", "deepseek/",
+    # Mistral & variants
+    "mistralai/", "mistral/",
+    # Meta models
+    "meta-llama/", "llama-",
+    # Qwen family
+    "qwen/",
+    # Additional tool-capable models
+    "minimax/", "x-ai/", "arcee-ai/",
 )
 
 # Models whose providers are confirmed NOT to implement the tool-calling API
 NON_TOOL_MODELS = {"google/palm-2-chat-bison"}
 
-def provider_supports_tools(model_name: str) -> bool:
+def provider_supports_tools(model_name: str) -> bool | None:
     """
-    Return True when the model is *known* to be tool-capable.
-    Unknown / unlisted models default to **True** so we don't
-    accidentally cripple new providers.
+    Returns:
+    - True: Model is known to support tools natively
+    - False: Model is known NOT to support tools 
+    - None: Unknown/uncertain - let caller decide
+    
+    This enables model-agnostic tool calling where unknown models
+    can use prompt scaffolding as fallback.
     """
     # Explicitly check for models that don't support tools
     if model_name.lower() in NON_TOOL_MODELS:
         return False
+    
+    # Check capabilities from loaded model data
+    caps = get_model_capabilities()
+    if model_name in caps:
+        return "tools" in caps[model_name]
     
     # Check if model matches any tool-capable prefix
     m = model_name.lower()
     if any(m.startswith(pfx) for pfx in TOOL_CAPABLE_PREFIXES):
         return True
     
-    # Default to True for unknown models to avoid accidentally stripping tools
-    return True
+    # Return None for unknown models - let the caller decide strategy
+    return None
+
+
+def supports_structured_tools(model_name: str) -> bool:
+    """
+    Compatibility function that returns True for models that support
+    native structured tool calling, False otherwise.
+    Used by the model-agnostic tool system.
+    """
+    result = provider_supports_tools(model_name)
+    return result is not False  # True or None -> True, False -> False
