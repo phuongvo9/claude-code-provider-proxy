@@ -176,6 +176,30 @@ def _get_capabilities_cached() -> dict[str, set[str]]:
     return _merge_with_overrides(_load_capabilities_file())
 
 
+# Providers that ARE tool-capable (prefix match, case-insensitive)
+TOOL_CAPABLE_PREFIXES = (
+    "gpt-", "openai/",           # OpenAI
+    "claude", "anthropic/",      # Anthropic
+    "google/gemini", "gemini",   # Google Gemini flash/pro/ultra
+)
+
+# Models whose providers are confirmed NOT to implement the tool-calling API
+NON_TOOL_MODELS = {"google/palm-2-chat-bison"}
+
 def provider_supports_tools(model_name: str) -> bool:
-    """Return True if this model exposes the function-call / tool API."""
-    return "tools" in get_model_capabilities().get(model_name, set())
+    """
+    Return True when the model is *known* to be tool-capable.
+    Unknown / unlisted models default to **True** so we don't
+    accidentally cripple new providers.
+    """
+    # Explicitly check for models that don't support tools
+    if model_name.lower() in NON_TOOL_MODELS:
+        return False
+    
+    # Check if model matches any tool-capable prefix
+    m = model_name.lower()
+    if any(m.startswith(pfx) for pfx in TOOL_CAPABLE_PREFIXES):
+        return True
+    
+    # Default to True for unknown models to avoid accidentally stripping tools
+    return True

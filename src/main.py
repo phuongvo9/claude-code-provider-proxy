@@ -370,7 +370,8 @@ class MessagesRequest(BaseModel):
         to avoid 422s downstream while still logging the downgrade.
         """
         model_name: str = info.data.get("model", "")
-        if v and not provider_supports_tools(model_name):
+        # remove tools only for providers we *know* can't accept them
+        if v and provider_supports_tools(model_name) is False:
             req_id = info.context.get("request_id") if info.context else None
             warning(
                 LogRecord(

@@ -38,3 +38,14 @@ def test_token_counter_skips_empty_schema():
     )
     # empty schema should add **no** extra tokens for the schema
     assert tokens > 0  # still counts message
+
+def test_gemini_tools_retained():
+    """Test that Gemini tools are retained and not stripped by the validator."""
+    req = MessagesRequest.model_validate(
+        {
+            "model": "google/gemini-2.5-flash-lite-preview-06-17",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "write_file", "input_schema": {}}],
+        }
+    )
+    assert req.tools is not None and len(req.tools) == 1
