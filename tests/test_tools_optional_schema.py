@@ -29,9 +29,12 @@ def test_tool_from_gemini_format():
 
 def test_token_counter_skips_empty_schema():
     """Test that token counter doesn't count empty schemas."""
+    from src.main import Message
+    
     tool = Tool(name="dummy")
+    messages = [Message(role="user", content="hi")]
     tokens = count_tokens_for_anthropic_request(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=messages,
         system=None,
         model_name="gpt-4o",
         tools=[tool],
@@ -44,6 +47,7 @@ def test_gemini_tools_retained():
     req = MessagesRequest.model_validate(
         {
             "model": "google/gemini-2.5-flash-lite-preview-06-17",
+            "max_tokens": 16,  # Add missing required field
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"name": "write_file", "input_schema": {}}],
         }

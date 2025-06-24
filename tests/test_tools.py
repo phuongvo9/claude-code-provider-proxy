@@ -1,5 +1,5 @@
 import pytest
-from main import MessagesRequest, Tool, count_tokens_for_anthropic_request
+from src.main import MessagesRequest, Tool, count_tokens_for_anthropic_request, Message
 
 BASE_MSG = [{"role": "user", "content": "ping"}]
 
@@ -14,8 +14,9 @@ def test_tool_without_schema_validates():
 
 def test_token_counter_skips_empty_schema():
     tool = Tool(name="dummy")
+    messages = [Message(role="user", content="hi")]
     tokens = count_tokens_for_anthropic_request(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=messages,
         system=None,
         model_name="gpt-4o",
         tools=[tool],
