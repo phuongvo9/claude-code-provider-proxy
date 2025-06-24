@@ -216,6 +216,26 @@ class TestToolSystem:
         # Should return True for unknown models (default to trying)
         assert supports_structured_tools("unknown-model") is True
 
+    def test_no_function_call_does_not_crash(self):
+        """Test that a response with no function call or None function_call doesn't crash."""
+        # Model declines to call a tool - just returns normal text
+        reply = {
+            "choices": [{"message": {"role": "assistant", "content": "I can help you with that."}}]
+        }
+        assert extract_tool_call(reply) is None
+        
+        # Model returns function_call: null explicitly
+        reply_with_null = {
+            "choices": [{"message": {"role": "assistant", "content": "OK", "function_call": None}}]
+        }
+        assert extract_tool_call(reply_with_null) is None
+        
+        # Model returns empty function_call dict
+        reply_with_empty = {
+            "choices": [{"message": {"role": "assistant", "content": "OK", "function_call": {}}}]
+        }
+        assert extract_tool_call(reply_with_empty) is None
+
 
 class TestToolExecutor:
     """Test individual tool executors."""

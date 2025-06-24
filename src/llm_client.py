@@ -44,6 +44,7 @@ def prepare_chat_request(
             "model": model,
             "messages": messages,
             "tools": tools,
+            "tool_choice": "auto",  # ✅ lets backend models decide freely
             **extra,
         }
 

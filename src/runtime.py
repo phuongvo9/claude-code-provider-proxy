@@ -48,9 +48,9 @@ def extract_tool_call(
                 "arguments": arguments
             }
 
-    # Check for function_call (older format)
-    if "function_call" in msg:
-        func = msg["function_call"]
+    # Check for function_call (older format) - handle None safely
+    func = msg.get("function_call")
+    if func and isinstance(func, dict) and func.get("name"):
         arguments = func.get("arguments", "{}")
         if isinstance(arguments, str):
             try:
